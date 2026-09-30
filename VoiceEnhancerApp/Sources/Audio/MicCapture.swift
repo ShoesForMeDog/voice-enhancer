@@ -34,7 +34,13 @@ final class MicCapture {
     private let logger = Logger(subsystem: "tech.aheadly.voice-enhancer", category: "MicCapture")
     private let engineBridge: AudioEngineBridge
     private let ringBridge: RingBufferBridge
-    private let avEngine = AVAudioEngine()
+    /// A fresh engine is created for every capture session. Reusing an engine
+    /// across route changes can leave AVFAudio's private tap state attached to
+    /// the input node even after `removeTap` returns. Installing the next tap
+    /// then raises an Objective-C exception and aborts the process. Replacing
+    /// the graph makes restarts deterministic and avoids that unrecoverable
+    /// duplicate-tap path entirely.
+    private var avEngine: AVAudioEngine?
     var engineConfigurationChangeHandler: (() -> Void)?
 
     /// Optional tap that receives raw pre-DSP audio (48 kHz mono float32).
@@ -66,13 +72,6 @@ final class MicCapture {
     init(engineBridge: AudioEngineBridge, ringBridge: RingBufferBridge) {
         self.engineBridge = engineBridge
         self.ringBridge = ringBridge
-        self.engineConfigurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: avEngine,
-            queue: nil
-        ) { [weak self] _ in
-            self?.handleEngineConfigurationChange()
-        }
     }
 
     deinit {
@@ -96,39 +95,61 @@ final class MicCapture {
 
         stop()
 
-        if let id = deviceID {
-            try bindInputDevice(id)
+        let engine = AVAudioEngine()
+        avEngine = engine
+        observeConfigurationChanges(for: engine)
+
+        do {
+            if let id = deviceID {
+                try bindInputDevice(id, to: engine)
+            }
+
+            // The DSP engine always runs at the ring's rate (48 kHz mono).
+            try engineBridge.prepare(
+                sampleRate: ringFormat.sampleRate,
+                maxBlockSize: Int32(Self.maxProcessingFrames)
+            )
+
+            // Mark a new writer session so the driver resyncs its read head.
+            ringBridge.bumpGeneration()
+
+            // Install a tap with the ring's target format. When the input
+            // device's native format differs (e.g. 44.1 kHz stereo USB mic),
+            // AVAudioEngine inserts an internal format converter that runs
+            // inside its managed audio graph — RT-safe, no allocations in our
+            // callback. The callback always receives 48 kHz mono float32.
+            let input = engine.inputNode
+            input.installTap(onBus: 0, bufferSize: 512, format: ringFormat) { [weak self] buffer, _ in
+                self?.handleInputBuffer(buffer)
+            }
+            tapInstalled = true
+
+            try engine.start()
+        } catch {
+            stop()
+            throw error
         }
-
-        // The DSP engine always runs at the ring's rate (48 kHz mono).
-        try engineBridge.prepare(
-            sampleRate: ringFormat.sampleRate,
-            maxBlockSize: Int32(Self.maxProcessingFrames)
-        )
-
-        // Mark a new writer session so the driver resyncs its read head.
-        ringBridge.bumpGeneration()
-
-        // Install a tap with the ring's target format. When the input
-        // device's native format differs (e.g. 44.1 kHz stereo USB mic),
-        // AVAudioEngine inserts an internal format converter that runs
-        // inside its managed audio graph — RT-safe, no allocations in our
-        // callback. The callback always receives 48 kHz mono float32.
-        let input = avEngine.inputNode
-        input.installTap(onBus: 0, bufferSize: 512, format: ringFormat) { [weak self] buffer, _ in
-            self?.handleInputBuffer(buffer)
-        }
-        tapInstalled = true
-
-        try avEngine.start()
     }
 
     func stop() {
+        if let engineConfigurationObserver {
+            NotificationCenter.default.removeObserver(engineConfigurationObserver)
+            self.engineConfigurationObserver = nil
+        }
+
+        guard let engine = avEngine else {
+            tapInstalled = false
+            hasLoggedFirstInputBuffer = false
+            return
+        }
+
         if tapInstalled {
-            avEngine.inputNode.removeTap(onBus: 0)
+            engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
-        avEngine.stop()
+        engine.stop()
+        engine.reset()
+        avEngine = nil
         hasLoggedFirstInputBuffer = false
     }
 
@@ -164,10 +185,15 @@ final class MicCapture {
         }
     }
 
-    private func handleEngineConfigurationChange() {
-        logger.notice("AVAudioEngine configuration changed; running=\(self.avEngine.isRunning, privacy: .public)")
-        DispatchQueue.main.async { [weak self] in
-            self?.engineConfigurationChangeHandler?()
+    private func observeConfigurationChanges(for engine: AVAudioEngine) {
+        engineConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self, weak engine] _ in
+            guard let self, let engine, self.avEngine === engine else { return }
+            self.logger.notice("AVAudioEngine configuration changed; running=\(engine.isRunning, privacy: .public)")
+            self.engineConfigurationChangeHandler?()
         }
     }
 
@@ -179,8 +205,8 @@ final class MicCapture {
     /// macOS — you set the underlying AUHAL unit's CurrentDevice property.
     /// Must be called before `avEngine.start()`; later changes require a
     /// full stop/start cycle to pick up.
-    private func bindInputDevice(_ id: AudioDeviceID) throws {
-        let audioUnit = avEngine.inputNode.audioUnit
+    private func bindInputDevice(_ id: AudioDeviceID, to engine: AVAudioEngine) throws {
+        let audioUnit = engine.inputNode.audioUnit
         guard let unit = audioUnit else {
             throw MicCaptureError.deviceBindingFailed(code: -1)
         }

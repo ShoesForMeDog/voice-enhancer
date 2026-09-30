@@ -11,7 +11,6 @@ import SwiftUI
 ///
 /// Deliberately NOT here:
 ///   * Per-parameter knobs. Presets-only UX in v1.
-///   * A menu bar item. Coming in v0.3.
 ///   * Device picker in the main pane. Device selection lives behind the
 ///     gear icon — it's a rare, set-once action.
 struct ContentView: View {
@@ -35,6 +34,12 @@ struct ContentView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView()
                 .frame(minWidth: 460, minHeight: 520)
+        }
+        .onAppear {
+            audio.setInterfaceVisible(true)
+        }
+        .onDisappear {
+            audio.setInterfaceVisible(false)
         }
     }
 }

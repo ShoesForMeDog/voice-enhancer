@@ -104,6 +104,7 @@ final class AudioViewModel: ObservableObject {
     private var configurationRestartTask: Task<Void, Never>?
     private var configurationStabilityTask: Task<Void, Never>?
     private var desiredRunningState = false
+    private var interfaceVisible = false
     private var configurationRestartAttempts = 0
 
     private static let maxConfigurationRestartAttempts = 3
@@ -141,7 +142,7 @@ final class AudioViewModel: ObservableObject {
     // MARK: - Lifecycle
 
     func start() async {
-
+        guard !desiredRunningState else { return }
         desiredRunningState = true
         await startCaptureGraph()
     }
@@ -178,7 +179,9 @@ final class AudioViewModel: ObservableObject {
 
             try await capture.start(deviceID: deviceID)
 
-            startMeterPolling()
+            if interfaceVisible {
+                startMeterPolling()
+            }
             configurationRestartTask?.cancel()
             configurationRestartTask = nil
             status = .running
@@ -265,6 +268,22 @@ final class AudioViewModel: ObservableObject {
     func stopPreviewPlayback() { preview.stopPlayback() }
     func resetPreview() { preview.reset() }
 
+    // MARK: - Interface lifecycle
+
+    /// Keep the audio graph alive when the last window closes, but stop the
+    /// 60 Hz UI meter timer while no interface is visible. This preserves the
+    /// virtual microphone without making SwiftUI redraw an invisible window.
+    func setInterfaceVisible(_ visible: Bool) {
+        guard interfaceVisible != visible else { return }
+        interfaceVisible = visible
+
+        if visible, desiredRunningState, status == .running {
+            startMeterPolling()
+        } else if !visible {
+            stopMeterPolling()
+        }
+    }
+
     // MARK: - Devices
 
     /// Rebuild the visible input device list. Call from the UI on settings
@@ -277,6 +296,7 @@ final class AudioViewModel: ObservableObject {
     // MARK: - Meters
 
     private func startMeterPolling() {
+        guard meterTimer == nil else { return }
         // 60 Hz matches typical display refresh. Peak-hold ballistics below
         // need a steady tick so the decay animates during silence — a
         // `.onChange` driven smoother would freeze at the last value when

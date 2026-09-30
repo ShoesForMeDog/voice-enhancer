@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
 /// Application entry point.
 ///
 /// This file should remain intentionally small. Anything more than "wire up
@@ -10,6 +16,8 @@ import AppKit
 /// mode, a CLI renderer for tuning).
 @main
 struct VoiceEnhancerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     /// The single shared view model. Injected via environment so any view
     /// that needs audio state can reach it without explicit passing.
     @StateObject private var audio = AudioViewModel()
@@ -37,5 +45,31 @@ struct VoiceEnhancerApp: App {
         }
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
+
+        MenuBarExtra("Voice Enhancer", systemImage: "waveform") {
+            VoiceEnhancerMenu()
+                .environmentObject(audio)
+        }
+    }
+}
+
+private struct VoiceEnhancerMenu: View {
+    @Environment(\.openWindow) private var openWindow
+    @EnvironmentObject private var audio: AudioViewModel
+
+    var body: some View {
+        Button("Open Voice Enhancer") {
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+
+        Toggle("Enhancement Enabled", isOn: $audio.isEnabled)
+
+        Divider()
+
+        Button("Quit Voice Enhancer") {
+            NSApp.terminate(nil)
+        }
+        .keyboardShortcut("q")
     }
 }
