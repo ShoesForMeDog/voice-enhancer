@@ -17,7 +17,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0.2</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Voice Enhancer needs microphone access to capture and process your audio in real time.</string>
 </dict>

@@ -1,7 +1,28 @@
 import SwiftUI
 import AppKit
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    let audio = AudioViewModel()
+    private let isBackgroundLaunch = ProcessInfo.processInfo.arguments.contains("--background-launch")
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // The LaunchAgent is the single owner of login startup. Without this,
+        // macOS may also restore whichever development or installed copy was
+        // running at logout and launch two copies from different paths.
+        NSApp.disableRelaunchOnLogin()
+
+        Task {
+            await audio.start()
+
+            if isBackgroundLaunch {
+                // Launching at login must start the capture graph without
+                // leaving the settings window open on the desktop.
+                NSApp.windows.first { $0.title == "Voice Enhancer" }?.close()
+            }
+        }
+    }
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
@@ -18,37 +39,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct VoiceEnhancerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
-    /// The single shared view model. Injected via environment so any view
-    /// that needs audio state can reach it without explicit passing.
-    @StateObject private var audio = AudioViewModel()
-
     var body: some Scene {
         Window("Voice Enhancer", id: "main") {
             ContentView()
-                .environmentObject(audio)
+                .environmentObject(appDelegate.audio)
                 .frame(minWidth: 520, minHeight: 420)
-                .task {
-                    // Start the audio graph when the window first appears.
-                    // Errors surface into audio.status for the UI to show.
-                    await audio.start()
-                }
-                // NOTE: Do NOT stop audio on window disappear. The user needs
-                // the capture graph running while the window is closed (e.g.
-                // during a Google Meet call). Audio stops only when the app
-                // actually quits (see onReceive below).
-                .onReceive(
-                    NotificationCenter.default.publisher(
-                        for: NSApplication.willTerminateNotification)
-                ) { _ in
-                    audio.stop()
-                }
         }
         .windowResizability(.contentSize)
         .windowStyle(.hiddenTitleBar)
 
         MenuBarExtra("Voice Enhancer", systemImage: "waveform") {
             VoiceEnhancerMenu()
-                .environmentObject(audio)
+                .environmentObject(appDelegate.audio)
         }
     }
 }

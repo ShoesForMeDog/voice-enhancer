@@ -49,7 +49,7 @@ targets:
       path: Sources/Resources/Info.plist
       properties:
         CFBundleShortVersionString: "1.0.2"
-        CFBundleVersion: "3"
+        CFBundleVersion: "4"
         NSMicrophoneUsageDescription: "Voice Enhancer needs microphone access to capture and process your audio in real time."
 
     entitlements:
