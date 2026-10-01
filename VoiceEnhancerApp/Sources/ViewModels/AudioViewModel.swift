@@ -77,6 +77,7 @@ final class AudioViewModel: ObservableObject {
     @Published var selectedInputUID: String? {
         didSet {
             guard oldValue != selectedInputUID else { return }
+            guard initializationComplete else { return }
             UserDefaults.standard.set(selectedInputUID, forKey: Self.inputUIDDefaultsKey)
             // Hot-swap: restart the capture graph with the new device.
             Task { await restartCaptureIfRunning() }
@@ -106,6 +107,7 @@ final class AudioViewModel: ObservableObject {
     private var desiredRunningState = false
     private var interfaceVisible = false
     private var configurationRestartAttempts = 0
+    private var initializationComplete = false
 
     private static let maxConfigurationRestartAttempts = 3
 
@@ -137,6 +139,7 @@ final class AudioViewModel: ObservableObject {
                 self?.previewState = state
             }
         }
+        initializationComplete = true
     }
 
     // MARK: - Lifecycle
@@ -224,7 +227,11 @@ final class AudioViewModel: ObservableObject {
         logger.notice("Restarting capture after engine configuration change (attempt \(self.configurationRestartAttempts, privacy: .public))")
         status = .starting
         configurationRestartTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            // Core Audio updates the default aggregate route before its
+            // physical subdevice/name mapping has settled. A one-second
+            // debounce lets Bluetooth/USB transitions finish so the restart
+            // binds to the newly selected microphone instead of the old one.
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             await self?.restartAfterConfigurationChange()
         }
     }

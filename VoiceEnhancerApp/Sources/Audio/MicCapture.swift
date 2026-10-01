@@ -4,6 +4,68 @@ import CoreAudio
 import AudioToolbox
 import os
 
+/// Converts the hardware-native tap buffers to the fixed DSP/ring format.
+/// The converter is created from the first buffer's actual format rather than
+/// from the input node's pre-start format. Bluetooth devices can advertise
+/// 48 kHz while idle and switch to 24 kHz only when capture begins.
+private final class NativeInputConverter {
+    private let outputFormat: AVAudioFormat
+    private let outputBuffer: AVAudioPCMBuffer
+    private var converter: AVAudioConverter?
+
+    init?(outputFormat: AVAudioFormat, maximumOutputFrames: AVAudioFrameCount) {
+        self.outputFormat = outputFormat
+        guard let outputBuffer = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: maximumOutputFrames
+        ) else { return nil }
+        self.outputBuffer = outputBuffer
+    }
+
+    func convert(_ inputBuffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        if formatsMatch(inputBuffer.format, outputFormat) {
+            return inputBuffer
+        }
+
+        if converter == nil || !formatsMatch(converter!.inputFormat, inputBuffer.format) {
+            guard let newConverter = AVAudioConverter(from: inputBuffer.format, to: outputFormat) else {
+                return nil
+            }
+            // Voice Enhancer intentionally uses the first channel of a
+            // multichannel microphone rather than mixing channels together.
+            newConverter.channelMap = [0]
+            newConverter.primeMethod = .none
+            converter = newConverter
+        }
+
+        guard let converter else { return nil }
+        outputBuffer.frameLength = 0
+        var suppliedInput = false
+        var conversionError: NSError?
+        let status = converter.convert(to: outputBuffer, error: &conversionError) { _, inputStatus in
+            if suppliedInput {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            suppliedInput = true
+            inputStatus.pointee = .haveData
+            return inputBuffer
+        }
+
+        guard conversionError == nil,
+              status != .error,
+              outputBuffer.frameLength > 0 else { return nil }
+        return outputBuffer
+    }
+
+    private func formatsMatch(_ lhs: AVAudioFormat, _ rhs: AVAudioFormat) -> Bool {
+        lhs.commonFormat == rhs.commonFormat
+            && lhs.sampleRate == rhs.sampleRate
+            && lhs.channelCount == rhs.channelCount
+            && lhs.isInterleaved == rhs.isInterleaved
+    }
+}
+
 /// Microphone capture + routing using `AVAudioEngine`.
 ///
 /// Responsibilities:
@@ -29,7 +91,7 @@ final class MicCapture {
     /// AVAudioEngine can hand us much larger blocks than the requested tap
     /// buffer size during route changes and on some built-in devices. Keep
     /// ample headroom so those blocks don't get dropped before DSP.
-    private static let maxProcessingFrames = 16_384
+    private static let maxProcessingFrames = 65_536
 
     private let logger = Logger(subsystem: "tech.aheadly.voice-enhancer", category: "MicCapture")
     private let engineBridge: AudioEngineBridge
@@ -41,6 +103,7 @@ final class MicCapture {
     /// the graph makes restarts deterministic and avoids that unrecoverable
     /// duplicate-tap path entirely.
     private var avEngine: AVAudioEngine?
+    private var inputConverter: NativeInputConverter?
     var engineConfigurationChangeHandler: (() -> Void)?
 
     /// Optional tap that receives raw pre-DSP audio (48 kHz mono float32).
@@ -49,8 +112,8 @@ final class MicCapture {
     var rawAudioTap: ((UnsafePointer<Float>, Int) -> Void)?
 
     /// The target format the ring expects. Fixed: 48 kHz, mono, float32.
-    /// The tap is installed with this format so AVAudioEngine handles any
-    /// sample rate or channel conversion in its internal graph (RT-safe).
+    /// Native input buffers are explicitly converted to this format after the
+    /// tap because AVAudioInputNode itself does not support conversion.
     private let ringFormat: AVAudioFormat = {
         AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
@@ -100,8 +163,20 @@ final class MicCapture {
         observeConfigurationChanges(for: engine)
 
         do {
-            if let id = deviceID {
+            // Treat the current system default as an explicit device for this
+            // capture session. During a route change AUHAL first constructs an
+            // input unit against a placeholder/default output device and only
+            // then switches it to the requested input. Building the graph in
+            // that transient state bakes the wrong format into the connection.
+            let resolvedDeviceID = deviceID ?? AudioDeviceEnumerator.defaultInputDevice()?.deviceID
+            var resolvedNativeFormat: AVAudioFormat?
+            if let id = resolvedDeviceID {
                 try bindInputDevice(id, to: engine)
+                try await waitForStableInputDevice(id, on: engine)
+                resolvedNativeFormat = nativeInputFormat(for: id)
+                let reportedRate = resolvedNativeFormat?.sampleRate ?? 0
+                let reportedChannels = resolvedNativeFormat?.channelCount ?? 0
+                logger.notice("Input device ready: id=\(id, privacy: .public), nativeRate=\(reportedRate, privacy: .public), channels=\(reportedChannels, privacy: .public)")
             }
 
             // The DSP engine always runs at the ring's rate (48 kHz mono).
@@ -113,14 +188,27 @@ final class MicCapture {
             // Mark a new writer session so the driver resyncs its read head.
             ringBridge.bumpGeneration()
 
-            // Install a tap with the ring's target format. When the input
-            // device's native format differs (e.g. 44.1 kHz stereo USB mic),
-            // AVAudioEngine inserts an internal format converter that runs
-            // inside its managed audio graph — RT-safe, no allocations in our
-            // callback. The callback always receives 48 kHz mono float32.
+            // AVAudioInputNode must run in the hardware's native format. A tap
+            // asking that node for 48 kHz aborts the process when, for example,
+            // a Bluetooth microphone switches to 24 kHz. Passing nil makes the
+            // tap follow the format that the hardware actually supplies. The
+            // callback then resamples into the ring's fixed format.
             let input = engine.inputNode
-            input.installTap(onBus: 0, bufferSize: 512, format: ringFormat) { [weak self] buffer, _ in
-                self?.handleInputBuffer(buffer)
+            let tapFormat = resolvedNativeFormat ?? input.outputFormat(forBus: 0)
+            guard tapFormat.sampleRate > 0, tapFormat.channelCount > 0 else {
+                throw MicCaptureError.invalidInputFormat
+            }
+            guard let converter = NativeInputConverter(
+                outputFormat: ringFormat,
+                maximumOutputFrames: AVAudioFrameCount(Self.maxProcessingFrames)
+            ) else {
+                throw MicCaptureError.invalidInputFormat
+            }
+            inputConverter = converter
+
+            input.installTap(onBus: 0, bufferSize: 512, format: tapFormat) { [weak self, converter] buffer, _ in
+                guard let convertedBuffer = converter.convert(buffer) else { return }
+                self?.handleInputBuffer(convertedBuffer)
             }
             tapInstalled = true
 
@@ -149,6 +237,7 @@ final class MicCapture {
         }
         engine.stop()
         engine.reset()
+        inputConverter = nil
         avEngine = nil
         hasLoggedFirstInputBuffer = false
     }
@@ -174,8 +263,7 @@ final class MicCapture {
         }
 
         // Copy channel 0 into the processing scratch buffer.
-        // The tap is installed with ringFormat so the buffer is always
-        // 48 kHz mono float32 — no conversion needed.
+        // NativeInputConverter guarantees 48 kHz mono float32 here.
         processingBuffer.withUnsafeMutableBufferPointer { dst in
             guard let base = dst.baseAddress else { return }
             base.update(from: channelData[0], count: frameCount)
@@ -193,6 +281,10 @@ final class MicCapture {
         ) { [weak self, weak engine] _ in
             guard let self, let engine, self.avEngine === engine else { return }
             self.logger.notice("AVAudioEngine configuration changed; running=\(engine.isRunning, privacy: .public)")
+            // Bluetooth activation can post a configuration notification after
+            // the graph has already adapted and resumed. Restarting a healthy
+            // running engine turns that harmless notification into a loop.
+            guard !engine.isRunning else { return }
             self.engineConfigurationChangeHandler?()
         }
     }
@@ -224,6 +316,121 @@ final class MicCapture {
         }
     }
 
+    /// Wait until AUHAL has actually adopted the requested device and its
+    /// native format has stopped changing. AudioUnitSetProperty can return
+    /// before the asynchronous device switch has propagated through
+    /// AVAudioInputNode; configuring the graph in that window produces a
+    /// stale 48 kHz connection for 24 kHz Bluetooth microphones.
+    private func waitForStableInputDevice(_ id: AudioDeviceID, on engine: AVAudioEngine) async throws {
+        var previousSampleRate: Double?
+        var previousChannelCount: AVAudioChannelCount?
+        var stableChecks = 0
+
+        for _ in 0..<40 {
+            let currentID = currentInputDeviceID(on: engine)
+            let format = engine.inputNode.outputFormat(forBus: 0)
+            let usableFormat = format.sampleRate > 0 && format.channelCount > 0
+
+            if currentID == id, usableFormat {
+                if previousSampleRate == format.sampleRate,
+                   previousChannelCount == format.channelCount {
+                    stableChecks += 1
+                    if stableChecks >= 3 { return }
+                } else {
+                    previousSampleRate = format.sampleRate
+                    previousChannelCount = format.channelCount
+                    stableChecks = 0
+                }
+            } else {
+                previousSampleRate = nil
+                previousChannelCount = nil
+                stableChecks = 0
+            }
+
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        throw MicCaptureError.deviceBindingTimedOut
+    }
+
+    private func currentInputDeviceID(on engine: AVAudioEngine) -> AudioDeviceID? {
+        guard let unit = engine.inputNode.audioUnit else { return nil }
+        var deviceID = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            &size
+        )
+        return status == noErr ? deviceID : nil
+    }
+
+    /// Read the physical device's native input rate and channel count directly
+    /// from HAL. AVAudioInputNode can temporarily report 48 kHz before a
+    /// Bluetooth microphone activates even though the device is already known
+    /// to capture at 24 kHz.
+    private func nativeInputFormat(for deviceID: AudioDeviceID) -> AVAudioFormat? {
+        var rateAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var sampleRate: Float64 = 0
+        var rateSize = UInt32(MemoryLayout<Float64>.size)
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &rateAddress,
+            0,
+            nil,
+            &rateSize,
+            &sampleRate
+        ) == noErr, sampleRate > 0 else { return nil }
+
+        var streamAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var streamSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
+            deviceID,
+            &streamAddress,
+            0,
+            nil,
+            &streamSize
+        ) == noErr, streamSize > 0 else { return nil }
+
+        let rawList = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(streamSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { rawList.deallocate() }
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &streamAddress,
+            0,
+            nil,
+            &streamSize,
+            rawList
+        ) == noErr else { return nil }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(
+            rawList.assumingMemoryBound(to: AudioBufferList.self)
+        )
+        let channelCount = buffers.reduce(UInt32(0)) { $0 + $1.mNumberChannels }
+        guard channelCount > 0 else { return nil }
+
+        return AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: sampleRate,
+            channels: AVAudioChannelCount(channelCount),
+            interleaved: false
+        )
+    }
+
     // MARK: - Permissions
 
     /// Request microphone permission asynchronously using a checked
@@ -252,6 +459,8 @@ final class MicCapture {
 enum MicCaptureError: LocalizedError {
     case microphonePermissionDenied
     case deviceBindingFailed(code: Int)
+    case deviceBindingTimedOut
+    case invalidInputFormat
 
     var errorDescription: String? {
         switch self {
@@ -259,6 +468,10 @@ enum MicCaptureError: LocalizedError {
             return "Microphone permission was not granted. Enable it in System Settings → Privacy & Security → Microphone."
         case .deviceBindingFailed(let code):
             return "Could not bind to the selected input device (code \(code))."
+        case .deviceBindingTimedOut:
+            return "The selected input device did not become ready in time. Try selecting it again."
+        case .invalidInputFormat:
+            return "The selected input device did not provide a usable audio format."
         }
     }
 }

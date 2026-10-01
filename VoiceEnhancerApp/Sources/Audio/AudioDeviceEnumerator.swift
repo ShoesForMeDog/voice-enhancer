@@ -50,7 +50,27 @@ enum AudioDeviceEnumerator {
             &addr, 0, nil, &size, &id
         )
         guard status == noErr, id != 0 else { return nil }
-        return listInputDevices().first { $0.deviceID == id }
+        let inputDevices = listInputDevices()
+        if let directMatch = inputDevices.first(where: { $0.deviceID == id }) {
+            return directMatch
+        }
+
+        // macOS may expose the default route as a private aggregate device.
+        // Its display name is updated before its active-subdevice list during
+        // a route switch, so prefer the matching physical input by name.
+        if let aggregateName = stringProperty(id: id, selector: kAudioDevicePropertyDeviceNameCFString),
+           let namedMatch = inputDevices.first(where: { $0.name == aggregateName }) {
+            return namedMatch
+        }
+
+        // Fall back to the aggregate composition when names differ.
+        // Bluetooth routes commonly have no input streams of their own until
+        // capture starts. Binding AVAudioEngine to that transient aggregate
+        // makes the input format change underneath an installed tap. Resolve
+        // it to the active physical input device (for example the 24 kHz
+        // AirPods microphone) up front.
+        let activeIDs = activeSubDeviceIDs(aggregateDeviceID: id)
+        return inputDevices.first { activeIDs.contains($0.deviceID) }
     }
 
     /// Whether the virtual Voice Enhancer input device is currently visible
@@ -109,6 +129,31 @@ enum AudioDeviceEnumerator {
         let buffers = UnsafeMutableAudioBufferListPointer(list)
         // Any buffer with at least one channel qualifies as an input stream.
         return buffers.contains { $0.mNumberChannels > 0 }
+    }
+
+    /// Return active physical devices for an aggregate default route. Ordinary
+    /// devices don't expose this property and simply produce an empty list.
+    private static func activeSubDeviceIDs(aggregateDeviceID id: AudioDeviceID) -> [AudioDeviceID] {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioAggregateDevicePropertyActiveSubDeviceList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(id, &addr) else { return [] }
+
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr,
+              size >= UInt32(MemoryLayout<AudioDeviceID>.size) else { return [] }
+
+        var ids = [AudioDeviceID](
+            repeating: 0,
+            count: Int(size) / MemoryLayout<AudioDeviceID>.size
+        )
+        let status = ids.withUnsafeMutableBufferPointer { buffer -> OSStatus in
+            guard let baseAddress = buffer.baseAddress else { return kAudioHardwareUnspecifiedError }
+            return AudioObjectGetPropertyData(id, &addr, 0, nil, &size, baseAddress)
+        }
+        return status == noErr ? ids : []
     }
 
     /// Read a CFString property and bridge it to a Swift string.
